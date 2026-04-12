@@ -21,6 +21,9 @@ build/
 debug_logs*/
 debug*.json
 
+# Claude Code
+.claude/
+
 # Project-specific
 _notes/
 requests/
