@@ -22,7 +22,7 @@ debug_logs*/
 debug*.json
 
 # Claude Code
-.claude/
+.claude/scheduled_tasks.lock
 
 # Project-specific
 _notes/
