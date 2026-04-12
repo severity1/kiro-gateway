@@ -1444,3 +1444,423 @@ class TestStreamWithFirstTokenRetryAnthropic:
         print(f"Call count: {call_count}")
         assert call_count == 5  # Should try exactly 5 times
         print("✓ max_retries parameter respected")
+
+
+# ==================================================================================================
+# Tests for thinking block lifecycle transitions in streaming
+# ==================================================================================================
+
+class TestStreamingThinkingBlockLifecycle:
+    """Tests for thinking block lifecycle transitions in streaming."""
+
+    @pytest.mark.asyncio
+    async def test_thinking_block_closed_when_content_arrives(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Closes thinking block when regular content arrives.
+        Goal: Verify thinking block is stopped before text block starts.
+        """
+        print("Setup: Mock stream with thinking then content...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="Let me reason...")
+            yield KiroEvent(type="content", content="The answer is 42")
+
+        print("Action: Streaming with as_reasoning_content mode...")
+        events = []
+
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                with patch('kiro.streaming_anthropic.FAKE_REASONING_HANDLING', 'as_reasoning_content'):
+                    async for event in stream_kiro_to_anthropic(
+                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                    ):
+                        events.append(event)
+
+        print(f"Received {len(events)} events")
+
+        # Find the thinking content_block_start
+        thinking_start_events = [e for e in events if "content_block_start" in e and '"thinking"' in e]
+        assert len(thinking_start_events) == 1
+        print("Phase 1: Thinking block started")
+
+        # Find the thinking content_block_stop (should come before text block start)
+        thinking_stop_idx = None
+        text_start_idx = None
+        for i, e in enumerate(events):
+            if "content_block_stop" in e and thinking_stop_idx is None and '"index": 0' in e:
+                thinking_stop_idx = i
+            if "content_block_start" in e and '"text"' in e:
+                text_start_idx = i
+
+        assert thinking_stop_idx is not None, "Thinking block should be stopped"
+        assert text_start_idx is not None, "Text block should be started"
+        assert thinking_stop_idx < text_start_idx, "Thinking stop should come before text start"
+        print("Phase 2: Thinking block closed before text block started")
+        print("Passed: thinking block lifecycle transition verified")
+
+    @pytest.mark.asyncio
+    async def test_as_reasoning_content_emits_thinking_block_and_deltas(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Emits thinking content_block_start with signature and thinking_delta events.
+        Goal: Verify as_reasoning_content mode produces correct Anthropic thinking blocks.
+        """
+        print("Setup: Mock stream with multiple thinking events...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="Step 1: ")
+            yield KiroEvent(type="thinking", thinking_content="analyze the problem")
+
+        print("Action: Streaming with as_reasoning_content mode...")
+        events = []
+
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                with patch('kiro.streaming_anthropic.FAKE_REASONING_HANDLING', 'as_reasoning_content'):
+                    async for event in stream_kiro_to_anthropic(
+                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                    ):
+                        events.append(event)
+
+        print(f"Received {len(events)} events")
+
+        # Verify thinking content_block_start with signature
+        thinking_start = [e for e in events if "content_block_start" in e and '"thinking"' in e]
+        assert len(thinking_start) == 1
+        assert "sig_" in thinking_start[0]
+        print("Phase 1: Thinking block started with signature")
+
+        # Verify thinking_delta events
+        thinking_deltas = [e for e in events if "thinking_delta" in e]
+        assert len(thinking_deltas) == 2
+        assert "Step 1: " in thinking_deltas[0]
+        assert "analyze the problem" in thinking_deltas[1]
+        print("Phase 2: Thinking deltas emitted correctly")
+        print("Passed: as_reasoning_content thinking blocks verified")
+
+    @pytest.mark.asyncio
+    async def test_include_as_text_emits_thinking_as_text_delta(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Emits thinking content as text_delta events in include_as_text mode.
+        Goal: Verify thinking content appears as regular text in include_as_text mode.
+        """
+        print("Setup: Mock stream with thinking then content...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="Internal reasoning")
+            yield KiroEvent(type="content", content="Final answer")
+
+        print("Action: Streaming with include_as_text mode...")
+        events = []
+
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                with patch('kiro.streaming_anthropic.FAKE_REASONING_HANDLING', 'include_as_text'):
+                    async for event in stream_kiro_to_anthropic(
+                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                    ):
+                        events.append(event)
+
+        print(f"Received {len(events)} events")
+
+        # Thinking content should appear as text_delta, not thinking_delta
+        thinking_deltas = [e for e in events if "thinking_delta" in e]
+        assert len(thinking_deltas) == 0, "Should not have thinking_delta in include_as_text mode"
+
+        text_deltas = [e for e in events if "text_delta" in e]
+        thinking_as_text = any("Internal reasoning" in e for e in text_deltas)
+        assert thinking_as_text, "Thinking content should appear as text_delta"
+        print("Passed: include_as_text mode emits thinking as text_delta")
+
+
+# ==================================================================================================
+# Tests for tool block handling in streaming
+# ==================================================================================================
+
+class TestStreamingToolBlockHandling:
+    """Tests for tool block handling in streaming."""
+
+    @pytest.mark.asyncio
+    async def test_tool_use_closes_open_thinking_block(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Closes an open thinking block when a tool_use event arrives.
+        Goal: Verify thinking block is properly closed before tool block starts.
+        """
+        print("Setup: Mock stream with thinking then tool_use...")
+
+        tool_use_data = {
+            "id": "toolu_abc123",
+            "function": {"name": "read_file", "arguments": '{"path": "/tmp/test.txt"}'}
+        }
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="thinking", thinking_content="I need to read a file")
+            yield KiroEvent(type="tool_use", tool_use=tool_use_data)
+
+        print("Action: Streaming with as_reasoning_content mode...")
+        events = []
+
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                with patch('kiro.streaming_anthropic.FAKE_REASONING_HANDLING', 'as_reasoning_content'):
+                    async for event in stream_kiro_to_anthropic(
+                        mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                    ):
+                        events.append(event)
+
+        print(f"Received {len(events)} events")
+
+        # Find thinking block stop and tool block start
+        thinking_stop_idx = None
+        tool_start_idx = None
+        for i, e in enumerate(events):
+            if "content_block_stop" in e and '"index": 0' in e:
+                thinking_stop_idx = i
+            if "content_block_start" in e and "tool_use" in e:
+                tool_start_idx = i
+
+        assert thinking_stop_idx is not None, "Thinking block should be stopped"
+        assert tool_start_idx is not None, "Tool block should be started"
+        assert thinking_stop_idx < tool_start_idx, "Thinking stop should come before tool start"
+        print("Passed: thinking block closed before tool block started")
+
+    @pytest.mark.asyncio
+    async def test_tool_use_with_truncation_detected_flag(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Saves truncation info when tool has _truncation_detected flag.
+        Goal: Verify truncated tool calls are tracked for recovery.
+        """
+        print("Setup: Mock stream with truncated tool call...")
+
+        tool_use_data = {
+            "id": "toolu_trunc123",
+            "function": {"name": "write_file", "arguments": '{"path": "/tmp/out.txt"}'},
+            "_truncation_detected": True,
+            "_truncation_info": {"size_bytes": 5000, "reason": "payload_too_large"}
+        }
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="tool_use", tool_use=tool_use_data)
+            yield KiroEvent(type="context_usage", context_usage_percentage=10.0)
+
+        print("Action: Streaming with truncation recovery enabled...")
+        events = []
+
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                with patch('kiro.truncation_recovery.should_inject_recovery', return_value=True):
+                    with patch('kiro.truncation_state.save_tool_truncation') as mock_save_tool:
+                        with patch('kiro.truncation_state.save_content_truncation'):
+                            async for event in stream_kiro_to_anthropic(
+                                mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                            ):
+                                events.append(event)
+
+        print(f"Received {len(events)} events")
+
+        mock_save_tool.assert_called_once_with(
+            tool_call_id="toolu_trunc123",
+            tool_name="write_file",
+            truncation_info={"size_bytes": 5000, "reason": "payload_too_large"}
+        )
+        print("Passed: save_tool_truncation called with correct args")
+
+
+# ==================================================================================================
+# Tests for truncation recovery saving in streaming
+# ==================================================================================================
+
+class TestStreamingTruncationRecoverySaving:
+    """Tests for truncation recovery saving in streaming."""
+
+    @pytest.mark.asyncio
+    async def test_saves_content_truncation_when_stream_incomplete(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Saves content truncation when stream ends without context_usage.
+        Goal: Verify content truncation is detected and saved for recovery.
+        """
+        print("Setup: Mock stream with content but no context_usage (simulating truncation)...")
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="This response was cut off mid-sentence and")
+
+        print("Action: Streaming with truncation recovery enabled...")
+        events = []
+
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                with patch('kiro.truncation_recovery.should_inject_recovery', return_value=True):
+                    with patch('kiro.truncation_state.save_content_truncation') as mock_save_content:
+                        with patch('kiro.truncation_state.save_tool_truncation'):
+                            async for event in stream_kiro_to_anthropic(
+                                mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                            ):
+                                events.append(event)
+
+        print(f"Received {len(events)} events")
+
+        mock_save_content.assert_called_once_with("This response was cut off mid-sentence and")
+        print("Passed: save_content_truncation called with truncated content")
+
+    @pytest.mark.asyncio
+    async def test_logs_truncation_summary(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Logs truncation summary when both tool and content truncation detected.
+        Goal: Verify truncation summary logging covers both tool and content cases.
+        """
+        print("Setup: Mock stream with truncated tool and no context_usage...")
+
+        tool_use_data = {
+            "id": "toolu_summ123",
+            "function": {"name": "execute", "arguments": '{}'},
+            "_truncation_detected": True,
+            "_truncation_info": {"size_bytes": 3000}
+        }
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Partial output")
+            yield KiroEvent(type="tool_use", tool_use=tool_use_data)
+
+        print("Action: Streaming with truncation recovery enabled...")
+        events = []
+
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                with patch('kiro.truncation_recovery.should_inject_recovery', return_value=True):
+                    with patch('kiro.truncation_state.save_tool_truncation') as mock_save_tool:
+                        with patch('kiro.truncation_state.save_content_truncation') as mock_save_content:
+                            async for event in stream_kiro_to_anthropic(
+                                mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                            ):
+                                events.append(event)
+
+        print(f"Received {len(events)} events")
+
+        mock_save_tool.assert_called_once_with(
+            tool_call_id="toolu_summ123",
+            tool_name="execute",
+            truncation_info={"size_bytes": 3000}
+        )
+        # Content truncation should NOT be saved when tool_blocks is non-empty
+        # (the code checks `not tool_blocks` for content truncation detection)
+        mock_save_content.assert_not_called()
+        print("Passed: tool truncation saved, content truncation skipped when tools present")
+
+
+# ==================================================================================================
+# Tests for response close error handling
+# ==================================================================================================
+
+class TestStreamingResponseCloseError:
+    """Tests for response close error handling."""
+
+    @pytest.mark.asyncio
+    async def test_response_aclose_error_is_caught(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Catches errors from response.aclose() without propagating.
+        Goal: Verify stream completes even if response close fails.
+        """
+        print("Setup: Mock response with failing aclose...")
+        mock_response.aclose = AsyncMock(side_effect=RuntimeError("Connection reset"))
+
+        async def mock_parse_kiro_stream(*args, **kwargs):
+            yield KiroEvent(type="content", content="Hello")
+
+        print("Action: Streaming to Anthropic format...")
+        events = []
+
+        with patch('kiro.streaming_anthropic.parse_kiro_stream', mock_parse_kiro_stream):
+            with patch('kiro.streaming_anthropic.parse_bracket_tool_calls', return_value=[]):
+                async for event in stream_kiro_to_anthropic(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                ):
+                    events.append(event)
+
+        print(f"Received {len(events)} events")
+
+        # Stream should complete with all expected events despite aclose error
+        assert any("message_start" in e for e in events)
+        assert any("message_stop" in e for e in events)
+        mock_response.aclose.assert_called()
+        print("Passed: stream completed despite response.aclose() error")
+
+
+# ==================================================================================================
+# Tests for thinking content in collect_anthropic_response
+# ==================================================================================================
+
+class TestCollectAnthropicResponseThinking:
+    """Tests for thinking content in collect_anthropic_response."""
+
+    @pytest.mark.asyncio
+    async def test_collect_includes_thinking_as_reasoning_content(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Includes thinking as a thinking content block in as_reasoning_content mode.
+        Goal: Verify collect_anthropic_response produces thinking blocks with signature.
+        """
+        print("Setup: Mock stream result with thinking content...")
+
+        mock_result = StreamResult(
+            content="The answer is 42",
+            thinking_content="Let me reason about this deeply",
+            tool_calls=[],
+            usage=None,
+            context_usage_percentage=None
+        )
+
+        print("Action: Collecting Anthropic response with as_reasoning_content...")
+
+        with patch('kiro.streaming_anthropic.collect_stream_to_result', return_value=mock_result):
+            with patch('kiro.streaming_anthropic.FAKE_REASONING_HANDLING', 'as_reasoning_content'):
+                result = await collect_anthropic_response(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                )
+
+        print(f"Result content blocks: {len(result['content'])}")
+
+        # First block should be thinking with signature
+        assert len(result["content"]) == 2
+        thinking_block = result["content"][0]
+        assert thinking_block["type"] == "thinking"
+        assert thinking_block["thinking"] == "Let me reason about this deeply"
+        assert thinking_block["signature"].startswith("sig_")
+        print("Phase 1: Thinking block has correct type and signature")
+
+        # Second block should be text
+        text_block = result["content"][1]
+        assert text_block["type"] == "text"
+        assert text_block["text"] == "The answer is 42"
+        print("Phase 2: Text block follows thinking block")
+        print("Passed: as_reasoning_content collect response verified")
+
+    @pytest.mark.asyncio
+    async def test_collect_includes_thinking_as_text(self, mock_response, mock_model_cache, mock_auth_manager):
+        """
+        What it does: Prepends thinking content to text in include_as_text mode.
+        Goal: Verify thinking content is merged into text block.
+        """
+        print("Setup: Mock stream result with thinking content...")
+
+        mock_result = StreamResult(
+            content="The answer is 42",
+            thinking_content="Deep thought: ",
+            tool_calls=[],
+            usage=None,
+            context_usage_percentage=None
+        )
+
+        print("Action: Collecting Anthropic response with include_as_text...")
+
+        with patch('kiro.streaming_anthropic.collect_stream_to_result', return_value=mock_result):
+            with patch('kiro.streaming_anthropic.FAKE_REASONING_HANDLING', 'include_as_text'):
+                result = await collect_anthropic_response(
+                    mock_response, "claude-sonnet-4", mock_model_cache, mock_auth_manager
+                )
+
+        print(f"Result content blocks: {len(result['content'])}")
+
+        # Should have single text block with thinking prepended
+        assert len(result["content"]) == 1
+        text_block = result["content"][0]
+        assert text_block["type"] == "text"
+        assert text_block["text"] == "Deep thought: The answer is 42"
+        print("Passed: include_as_text prepends thinking to text content")

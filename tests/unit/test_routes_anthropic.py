@@ -1589,3 +1589,542 @@ class TestContentTruncationRecovery:
         print("Checking: Message unchanged...")
         text = self._get_block_value(modified_messages[0].content[0], "text")
         assert text == "This is a complete response."
+
+
+# =============================================================================
+# Tests for error response handling when Kiro API returns non-200
+# =============================================================================
+
+class TestMessagesErrorResponseHandling:
+    """Tests for error response handling when Kiro API returns non-200."""
+
+    @staticmethod
+    def _build_mock_client(mock_class, status_code, aread_value=None, aread_side_effect=None):
+        """Helper to build a mock KiroHttpClient and response."""
+        mock_response = MagicMock()
+        mock_response.status_code = status_code
+        if aread_side_effect:
+            mock_response.aread = AsyncMock(side_effect=aread_side_effect)
+        else:
+            mock_response.aread = AsyncMock(return_value=aread_value or b"")
+
+        mock_instance = AsyncMock()
+        mock_instance.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_instance.close = AsyncMock()
+        mock_class.return_value = mock_instance
+        return mock_instance, mock_response
+
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_returns_anthropic_error_on_kiro_400(
+        self, mock_client_class, mock_converter, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies a 400 from Kiro API is returned in Anthropic error format.
+        Purpose: Ensure upstream errors are properly translated.
+        """
+        print("Setup: Mock KiroHttpClient returning 400...")
+        self._build_mock_client(
+            mock_client_class,
+            status_code=400,
+            aread_value=b'{"message": "Input is too long.", "reason": "CONTENT_LENGTH_EXCEEDS_THRESHOLD"}'
+        )
+
+        print("Action: POST /v1/messages...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }
+        )
+
+        print(f"Checking: status={response.status_code}")
+        assert response.status_code == 400
+        data = response.json()
+        assert data["type"] == "error"
+        assert data["error"]["type"] == "api_error"
+
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_returns_anthropic_error_on_kiro_500_non_json(
+        self, mock_client_class, mock_converter, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies a 500 with non-JSON body is returned in Anthropic error format.
+        Purpose: Ensure non-JSON upstream errors are handled gracefully.
+        """
+        print("Setup: Mock KiroHttpClient returning 500 with plain text...")
+        self._build_mock_client(
+            mock_client_class,
+            status_code=500,
+            aread_value=b"Internal Server Error"
+        )
+
+        print("Action: POST /v1/messages...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }
+        )
+
+        print(f"Checking: status={response.status_code}")
+        assert response.status_code == 500
+        data = response.json()
+        assert data["type"] == "error"
+        assert "Internal Server Error" in data["error"]["message"]
+
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_returns_anthropic_error_on_unreadable_body(
+        self, mock_client_class, mock_converter, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies an unreadable response body is handled gracefully.
+        Purpose: Ensure connection errors during body read don't crash the endpoint.
+        """
+        print("Setup: Mock KiroHttpClient returning 502 with aread raising RuntimeError...")
+        self._build_mock_client(
+            mock_client_class,
+            status_code=502,
+            aread_side_effect=RuntimeError("connection reset")
+        )
+
+        print("Action: POST /v1/messages...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }
+        )
+
+        print(f"Checking: status={response.status_code}")
+        assert response.status_code != 200
+        data = response.json()
+        assert data["type"] == "error"
+        assert "Unknown error" in data["error"]["message"]
+
+    @patch('kiro.routes_anthropic.debug_logger')
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_error_response_flushes_debug_logger(
+        self, mock_client_class, mock_converter, mock_debug_logger, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies debug_logger.flush_on_error is called on non-200 response.
+        Purpose: Ensure debug logs are flushed for error diagnosis.
+        """
+        print("Setup: Mock KiroHttpClient returning 400...")
+        self._build_mock_client(
+            mock_client_class,
+            status_code=400,
+            aread_value=b'{"message": "Bad request", "reason": "INVALID"}'
+        )
+
+        print("Action: POST /v1/messages...")
+        test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }
+        )
+
+        print("Checking: debug_logger.flush_on_error was called...")
+        mock_debug_logger.flush_on_error.assert_called()
+
+
+# =============================================================================
+# Tests for streaming error handling in /v1/messages endpoint
+# =============================================================================
+
+class TestMessagesStreamingErrorHandling:
+    """Tests for streaming error handling in /v1/messages endpoint."""
+
+    @staticmethod
+    def _build_mock_client(mock_class, status_code=200):
+        """Helper to build a mock KiroHttpClient returning given status."""
+        mock_response = MagicMock()
+        mock_response.status_code = status_code
+        mock_response.aread = AsyncMock(return_value=b"")
+
+        mock_instance = AsyncMock()
+        mock_instance.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_instance.close = AsyncMock()
+        mock_class.return_value = mock_instance
+        return mock_instance, mock_response
+
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.stream_kiro_to_anthropic')
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_streaming_exception_sends_error_event(
+        self, mock_client_class, mock_stream_fn, mock_converter, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies a streaming exception sends an SSE error event.
+        Purpose: Ensure clients receive error notification during streaming.
+        """
+        print("Setup: Mock stream that raises after one chunk...")
+
+        async def failing_stream(*args, **kwargs):
+            yield 'event: message_start\ndata: {"type":"message_start"}\n\n'
+            raise RuntimeError("stream broke")
+
+        mock_stream_fn.side_effect = failing_stream
+        self._build_mock_client(mock_client_class, status_code=200)
+
+        print("Action: POST /v1/messages with stream=true...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True
+            }
+        )
+
+        print("Checking: response body contains error event...")
+        body = response.text
+        assert "event: error" in body
+
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.stream_kiro_to_anthropic')
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_streaming_finally_closes_http_client(
+        self, mock_client_class, mock_stream_fn, mock_converter, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies HTTP client is closed after streaming completes (even on error).
+        Purpose: Prevent resource leaks on streaming failures.
+        """
+        print("Setup: Mock stream that raises after one chunk...")
+
+        async def failing_stream(*args, **kwargs):
+            yield 'event: message_start\ndata: {"type":"message_start"}\n\n'
+            raise RuntimeError("stream broke")
+
+        mock_stream_fn.side_effect = failing_stream
+        mock_instance, _ = self._build_mock_client(mock_client_class, status_code=200)
+
+        print("Action: POST /v1/messages with stream=true...")
+        test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True
+            }
+        )
+
+        print("Checking: http_client.close() was called...")
+        mock_instance.close.assert_awaited()
+
+    @patch('kiro.routes_anthropic.debug_logger')
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.stream_kiro_to_anthropic')
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_streaming_error_flushes_debug_logger(
+        self, mock_client_class, mock_stream_fn, mock_converter, mock_debug_logger,
+        test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies debug_logger.flush_on_error is called on streaming error.
+        Purpose: Ensure debug logs are flushed for streaming error diagnosis.
+        """
+        print("Setup: Mock stream that raises after one chunk...")
+
+        async def failing_stream(*args, **kwargs):
+            yield 'event: message_start\ndata: {"type":"message_start"}\n\n'
+            raise RuntimeError("stream broke")
+
+        mock_stream_fn.side_effect = failing_stream
+        self._build_mock_client(mock_client_class, status_code=200)
+
+        print("Action: POST /v1/messages with stream=true...")
+        test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True
+            }
+        )
+
+        print("Checking: debug_logger.flush_on_error was called with 500...")
+        mock_debug_logger.flush_on_error.assert_called_with(500, "stream broke")
+
+    @patch('kiro.routes_anthropic.debug_logger')
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.stream_kiro_to_anthropic')
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_streaming_success_discards_debug_buffers(
+        self, mock_client_class, mock_stream_fn, mock_converter, mock_debug_logger,
+        test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies debug_logger.discard_buffers is called on successful stream.
+        Purpose: Ensure debug buffers are cleaned up after successful requests.
+        """
+        print("Setup: Mock stream that yields valid events...")
+
+        async def ok_stream(*args, **kwargs):
+            yield 'event: message_start\ndata: {"type":"message_start"}\n\n'
+            yield 'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+
+        mock_stream_fn.side_effect = ok_stream
+        self._build_mock_client(mock_client_class, status_code=200)
+
+        print("Action: POST /v1/messages with stream=true...")
+        test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}],
+                "stream": True
+            }
+        )
+
+        print("Checking: debug_logger.discard_buffers was called...")
+        mock_debug_logger.discard_buffers.assert_called()
+
+
+# =============================================================================
+# Tests for non-streaming response collection path
+# =============================================================================
+
+class TestMessagesNonStreamingPath:
+    """Tests for non-streaming response collection path."""
+
+    @staticmethod
+    def _build_mock_client(mock_class, status_code=200):
+        """Helper to build a mock KiroHttpClient returning given status."""
+        mock_response = MagicMock()
+        mock_response.status_code = status_code
+        mock_response.aread = AsyncMock(return_value=b"")
+
+        mock_instance = AsyncMock()
+        mock_instance.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_instance.close = AsyncMock()
+        mock_class.return_value = mock_instance
+        return mock_instance, mock_response
+
+    @patch('kiro.routes_anthropic.collect_anthropic_response')
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_non_streaming_collects_response(
+        self, mock_client_class, mock_converter, mock_collect, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies non-streaming path collects and returns the full response.
+        Purpose: Ensure non-streaming responses are properly assembled.
+        """
+        print("Setup: Mock collect_anthropic_response returning valid response...")
+        expected_response = {
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Hello!"}],
+            "model": "claude-sonnet-4-5",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        }
+        mock_collect.return_value = expected_response
+        self._build_mock_client(mock_client_class, status_code=200)
+
+        print("Action: POST /v1/messages (non-streaming)...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }
+        )
+
+        print(f"Checking: status={response.status_code}")
+        assert response.status_code == 200
+        data = response.json()
+        assert data["id"] == "msg_test"
+        assert data["content"][0]["text"] == "Hello!"
+
+    @patch('kiro.routes_anthropic.collect_anthropic_response', return_value={"id": "msg_test", "type": "message"})
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_non_streaming_closes_http_client(
+        self, mock_client_class, mock_converter, mock_collect, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies HTTP client is closed after non-streaming response.
+        Purpose: Prevent resource leaks on non-streaming path.
+        """
+        print("Setup: Mock KiroHttpClient returning 200...")
+        mock_instance, _ = self._build_mock_client(mock_client_class, status_code=200)
+
+        print("Action: POST /v1/messages (non-streaming)...")
+        test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }
+        )
+
+        print("Checking: http_client.close() was called...")
+        mock_instance.close.assert_awaited()
+
+    @patch('kiro.routes_anthropic.debug_logger')
+    @patch('kiro.routes_anthropic.collect_anthropic_response', return_value={"id": "msg_test", "type": "message"})
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_non_streaming_discards_debug_buffers(
+        self, mock_client_class, mock_converter, mock_collect, mock_debug_logger,
+        test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies debug_logger.discard_buffers is called on successful non-streaming response.
+        Purpose: Ensure debug buffers are cleaned up after successful requests.
+        """
+        print("Setup: Mock KiroHttpClient returning 200...")
+        self._build_mock_client(mock_client_class, status_code=200)
+
+        print("Action: POST /v1/messages (non-streaming)...")
+        test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }
+        )
+
+        print("Checking: debug_logger.discard_buffers was called...")
+        mock_debug_logger.discard_buffers.assert_called()
+
+
+# =============================================================================
+# Tests for conversion error handling
+# =============================================================================
+
+class TestMessagesConversionError:
+    """Tests for conversion error handling."""
+
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', side_effect=ValueError("No messages provided"))
+    def test_conversion_value_error_returns_400(
+        self, mock_converter, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies a ValueError during conversion returns 400 with invalid_request_error.
+        Purpose: Ensure conversion validation errors are surfaced to the client.
+        """
+        print("Setup: Mock anthropic_to_kiro raising ValueError...")
+
+        print("Action: POST /v1/messages...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }
+        )
+
+        print(f"Checking: status={response.status_code}")
+        assert response.status_code == 400
+        data = response.json()
+        assert data["type"] == "error"
+        assert data["error"]["type"] == "invalid_request_error"
+
+
+# =============================================================================
+# Tests for general exception handling in /v1/messages
+# =============================================================================
+
+class TestMessagesGeneralExceptionHandling:
+    """Tests for general exception handling in /v1/messages."""
+
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_unexpected_exception_returns_500(
+        self, mock_client_class, mock_converter, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies an unexpected exception returns 500 with api_error.
+        Purpose: Ensure unhandled errors are caught and returned in Anthropic format.
+        """
+        print("Setup: Mock KiroHttpClient.request_with_retry raising RuntimeError...")
+        mock_instance = AsyncMock()
+        mock_instance.request_with_retry = AsyncMock(side_effect=RuntimeError("unexpected"))
+        mock_instance.close = AsyncMock()
+        mock_client_class.return_value = mock_instance
+
+        print("Action: POST /v1/messages...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }
+        )
+
+        print(f"Checking: status={response.status_code}")
+        assert response.status_code == 500
+        data = response.json()
+        assert data["type"] == "error"
+        assert data["error"]["type"] == "api_error"
+        assert "Internal Server Error" in data["error"]["message"]
+
+    @patch('kiro.routes_anthropic.debug_logger')
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_unexpected_exception_flushes_debug_logger(
+        self, mock_client_class, mock_converter, mock_debug_logger, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies debug_logger.flush_on_error is called on unexpected exception.
+        Purpose: Ensure debug logs are flushed for unhandled error diagnosis.
+        """
+        print("Setup: Mock KiroHttpClient.request_with_retry raising RuntimeError...")
+        mock_instance = AsyncMock()
+        mock_instance.request_with_retry = AsyncMock(side_effect=RuntimeError("unexpected"))
+        mock_instance.close = AsyncMock()
+        mock_client_class.return_value = mock_instance
+
+        print("Action: POST /v1/messages...")
+        test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }
+        )
+
+        print("Checking: debug_logger.flush_on_error was called with 500...")
+        mock_debug_logger.flush_on_error.assert_called_with(500, "unexpected")

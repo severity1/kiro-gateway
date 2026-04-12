@@ -1307,6 +1307,49 @@ class TestConvertAnthropicMessages:
         # We verify the images are extracted correctly, which proves the counting works
         print("Images extracted successfully - logging verification complete")
 
+    def test_tool_result_images_assigned_when_no_top_level_images(self):
+        """
+        What it does: Verifies images from tool_result are assigned when no top-level images exist.
+        Purpose: Ensure the else branch (images = tool_result_images) is covered when
+        extract_images_from_content returns empty but extract_images_from_tool_results returns images.
+        """
+        print("Setup: User message with tool_result containing image but no top-level images...")
+        messages = [
+            AnthropicMessage(
+                role="user",
+                content=[
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "call_screenshot",
+                        "content": [
+                            {"type": "text", "text": "Screenshot captured"},
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "tool_result_image_data",
+                                },
+                            },
+                        ],
+                    }
+                ],
+            )
+        ]
+
+        print("Action: Converting messages...")
+        result = convert_anthropic_messages(messages)
+
+        print(f"Result: {result}")
+        print(f"Images: {result[0].images}")
+
+        assert len(result) == 1
+        assert result[0].role == "user"
+        assert result[0].images is not None, "images should be assigned from tool_result images"
+        assert len(result[0].images) == 1
+        assert result[0].images[0]["media_type"] == "image/png"
+        assert result[0].images[0]["data"] == "tool_result_image_data"
+
 
 # ==================================================================================================
 # Tests for convert_anthropic_tools
