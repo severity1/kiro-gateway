@@ -2128,3 +2128,297 @@ class TestMessagesGeneralExceptionHandling:
 
         print("Checking: debug_logger.flush_on_error was called with 500...")
         mock_debug_logger.flush_on_error.assert_called_with(500, "unexpected")
+
+
+# =============================================================================
+# Tests for truncation recovery through the actual endpoint
+# =============================================================================
+
+class TestMessagesEndpointTruncationRecovery:
+    """
+    Tests for truncation recovery code paths exercised through the /v1/messages endpoint.
+
+    Covers lines 172-248 of routes_anthropic.py: dict/Pydantic block handling,
+    tool_result modification, content truncation synthetic message injection.
+    """
+
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_endpoint_modifies_tool_result_with_truncation(
+        self, mock_client_class, mock_converter, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies tool_result blocks are modified when truncation info exists in cache.
+        Purpose: Exercise the truncation recovery code path through the actual endpoint (lines 172-208).
+        """
+        print("Setup: Saving truncation info to cache...")
+        from kiro.truncation_state import save_tool_truncation
+        tool_use_id = "tooluse_endpoint_test_1"
+        save_tool_truncation(tool_use_id, "write_to_file", {"size_bytes": 5000, "reason": "test"})
+
+        print("Setup: Mock KiroHttpClient returning 200...")
+        mock_instance = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_instance.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_instance.close = AsyncMock()
+        mock_client_class.return_value = mock_instance
+
+        print("Action: POST /v1/messages with tool_result that has truncation info...")
+        test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [
+                    {"role": "user", "content": "What's the weather?"},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {"type": "tool_use", "id": tool_use_id, "name": "write_to_file", "input": {}}
+                        ]
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "tool_result", "tool_use_id": tool_use_id, "content": "original result"}
+                        ]
+                    }
+                ]
+            }
+        )
+
+        print("Checking: anthropic_to_kiro was called with modified messages...")
+        assert mock_converter.called
+        call_args = mock_converter.call_args[0]
+        request_data = call_args[0]
+        # Find the user message with tool_result
+        tool_result_msg = [m for m in request_data.messages if m.role == "user" and m.content and isinstance(m.content, list)][-1]
+        tool_result_block = tool_result_msg.content[0]
+        content = tool_result_block.get("content") if isinstance(tool_result_block, dict) else getattr(tool_result_block, "content", "")
+        print(f"Content: {str(content)[:100]}...")
+        assert "[API Limitation]" in str(content)
+        assert "original result" in str(content)
+
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_endpoint_adds_synthetic_message_for_content_truncation(
+        self, mock_client_class, mock_converter, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies synthetic user message is added after truncated assistant message.
+        Purpose: Exercise content truncation recovery through the endpoint (lines 218-248).
+        """
+        print("Setup: Saving content truncation info...")
+        from kiro.truncation_state import save_content_truncation
+        truncated_text = "This response was cut off mid-sentence by the API and never finished"
+        save_content_truncation(truncated_text)
+
+        print("Setup: Mock KiroHttpClient returning 200...")
+        mock_instance = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_instance.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_instance.close = AsyncMock()
+        mock_client_class.return_value = mock_instance
+
+        print("Action: POST /v1/messages with truncated assistant message (string content)...")
+        test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [
+                    {"role": "user", "content": "Tell me a story"},
+                    {
+                        "role": "assistant",
+                        "content": truncated_text
+                    },
+                    {"role": "user", "content": "Continue"}
+                ]
+            }
+        )
+
+        print("Checking: anthropic_to_kiro was called with extra synthetic message...")
+        assert mock_converter.called
+        call_args = mock_converter.call_args[0]
+        request_data = call_args[0]
+        messages = request_data.messages
+        # Should have 4 messages: user, assistant, synthetic_user, user
+        print(f"Message count: {len(messages)}")
+        assert len(messages) == 4
+        assert messages[2].role == "user"
+        synthetic_content = messages[2].content
+        if isinstance(synthetic_content, list):
+            text = synthetic_content[0].get("text", "") if isinstance(synthetic_content[0], dict) else getattr(synthetic_content[0], "text", "")
+        else:
+            text = str(synthetic_content)
+        print(f"Synthetic message: {text[:80]}...")
+        assert "[System Notice]" in text
+
+
+# =============================================================================
+# Tests for profile ARN and HTTPException handling
+# =============================================================================
+
+class TestMessagesProfileArnAndHTTPException:
+    """Tests for profile ARN handling and HTTPException re-raise."""
+
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_profile_arn_set_for_kiro_desktop_auth(
+        self, mock_client_class, mock_converter, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies profile_arn is passed when auth_type is KIRO_DESKTOP.
+        Purpose: Exercise profile ARN code path (line 257).
+        """
+        print("Setup: Set auth_manager to KIRO_DESKTOP with profile_arn...")
+        from kiro.auth import AuthType
+        app = test_client.app
+        mock_auth = MagicMock()
+        mock_auth.auth_type = AuthType.KIRO_DESKTOP
+        mock_auth.profile_arn = "arn:aws:iam::123456:role/test"
+        mock_auth.api_host = "https://q.us-east-1.amazonaws.com"
+        app.state.auth_manager = mock_auth
+
+        mock_instance = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_instance.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_instance.close = AsyncMock()
+        mock_client_class.return_value = mock_instance
+
+        print("Action: POST /v1/messages...")
+        test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }
+        )
+
+        print("Checking: anthropic_to_kiro called with profile_arn...")
+        assert mock_converter.called
+        call_args = mock_converter.call_args[0]
+        profile_arn = call_args[2]
+        print(f"profile_arn: {profile_arn}")
+        assert profile_arn == "arn:aws:iam::123456:role/test"
+
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_http_exception_reraises_and_closes_client(
+        self, mock_client_class, mock_converter, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies HTTPException is re-raised and client is closed.
+        Purpose: Exercise HTTPException handling (lines 430-435).
+        """
+        print("Setup: Mock KiroHttpClient that raises HTTPException...")
+        mock_instance = AsyncMock()
+        mock_instance.request_with_retry = AsyncMock(
+            side_effect=HTTPException(status_code=503, detail="Service Unavailable")
+        )
+        mock_instance.close = AsyncMock()
+        mock_client_class.return_value = mock_instance
+
+        print("Action: POST /v1/messages...")
+        response = test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }
+        )
+
+        print(f"Status: {response.status_code}")
+        assert response.status_code == 503
+        print("Checking: http_client.close() was called...")
+        mock_instance.close.assert_called()
+
+    @patch('kiro.routes_anthropic.debug_logger', new_callable=MagicMock)
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_http_exception_flushes_debug_logger(
+        self, mock_client_class, mock_converter, mock_debug_logger, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies debug_logger is flushed on HTTPException.
+        Purpose: Exercise debug logger flush in HTTPException handler (lines 433-434).
+        """
+        print("Setup: Mock KiroHttpClient that raises HTTPException...")
+        mock_instance = AsyncMock()
+        mock_instance.request_with_retry = AsyncMock(
+            side_effect=HTTPException(status_code=503, detail="Service Unavailable")
+        )
+        mock_instance.close = AsyncMock()
+        mock_client_class.return_value = mock_instance
+
+        print("Action: POST /v1/messages...")
+        test_client.post(
+            "/v1/messages",
+            headers={"x-api-key": valid_proxy_api_key},
+            json={
+                "model": "claude-sonnet-4-5",
+                "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hello"}]
+            }
+        )
+
+        print("Checking: debug_logger.flush_on_error was called...")
+        mock_debug_logger.flush_on_error.assert_called()
+
+
+# =============================================================================
+# Tests for streaming GeneratorExit and debug logger kiro request logging
+# =============================================================================
+
+class TestMessagesStreamingDisconnectAndLogging:
+    """Tests for client disconnect and kiro request body logging."""
+
+    @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
+    @patch('kiro.routes_anthropic.KiroHttpClient')
+    def test_kiro_request_body_logging_error_handled(
+        self, mock_client_class, mock_converter, test_client, valid_proxy_api_key
+    ):
+        """
+        What it does: Verifies exception during kiro request body logging is caught.
+        Purpose: Exercise the except branch in request body logging (lines 283-284).
+        """
+        print("Setup: Mock anthropic_to_kiro returning non-serializable data...")
+        mock_converter.return_value = {"data": object()}  # Not JSON serializable
+
+        mock_instance = AsyncMock()
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_instance.request_with_retry = AsyncMock(return_value=mock_response)
+        mock_instance.close = AsyncMock()
+        mock_client_class.return_value = mock_instance
+
+        print("Action: POST /v1/messages with stream=false...")
+        with patch('kiro.routes_anthropic.collect_anthropic_response', new_callable=AsyncMock) as mock_collect:
+            mock_collect.return_value = {
+                "id": "msg_test", "type": "message", "role": "assistant",
+                "content": [{"type": "text", "text": "Hi"}],
+                "model": "claude-sonnet-4-5", "stop_reason": "end_turn",
+                "stop_sequence": None, "usage": {"input_tokens": 10, "output_tokens": 5}
+            }
+            response = test_client.post(
+                "/v1/messages",
+                headers={"x-api-key": valid_proxy_api_key},
+                json={
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 1024,
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }
+            )
+
+        print(f"Status: {response.status_code}")
+        # Should still succeed despite logging error
+        assert response.status_code == 200
