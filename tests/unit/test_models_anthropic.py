@@ -1026,19 +1026,19 @@ class TestAnthropicTool:
         print(f"ValidationError raised: {exc_info.value}")
         assert "name" in str(exc_info.value)
     
-    def test_requires_input_schema(self):
+    def test_input_schema_is_optional_for_server_tools(self):
         """
-        What it does: Verifies that input_schema is required.
-        Purpose: Ensure validation fails without input_schema.
+        What it does: Verifies that input_schema is optional.
+        Purpose: Server-managed tools (e.g., web_search_20250305) don't have input_schema.
         """
-        print("Setup: Attempting to create AnthropicTool without input_schema...")
-        
-        print("Action: Creating model (should raise ValidationError)...")
-        with pytest.raises(ValidationError) as exc_info:
-            AnthropicTool(name="test")
-        
-        print(f"ValidationError raised: {exc_info.value}")
-        assert "input_schema" in str(exc_info.value)
+        print("Setup: Creating AnthropicTool without input_schema...")
+
+        print("Action: Creating model...")
+        tool = AnthropicTool(name="web_search", type="web_search_20250305")
+
+        print(f"Tool: {tool}")
+        assert tool.name == "web_search"
+        assert tool.input_schema is None
     
     def test_description_is_optional(self):
         """

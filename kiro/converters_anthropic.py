@@ -356,11 +356,19 @@ def convert_anthropic_tools(
         if isinstance(tool, dict):
             name = tool.get("name", "")
             description = tool.get("description")
-            input_schema = tool.get("input_schema", {})
+            input_schema = tool.get("input_schema")
+            tool_type = tool.get("type")
         else:
             name = tool.name
             description = tool.description
             input_schema = tool.input_schema
+            tool_type = getattr(tool, "type", None)
+
+        # Skip server-managed tools (e.g., web_search_20250305) - they have a
+        # type field but no input_schema and are handled by the API server
+        if input_schema is None:
+            logger.debug(f"Skipping server-managed tool '{name}' (type={tool_type})")
+            continue
 
         unified_tools.append(
             UnifiedTool(name=name, description=description, input_schema=input_schema)
