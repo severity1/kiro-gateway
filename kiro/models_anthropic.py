@@ -64,18 +64,6 @@ class ThinkingContentBlock(BaseModel):
     signature: str = ""
 
 
-class RedactedThinkingContentBlock(BaseModel):
-    """
-    Redacted thinking content block in Anthropic format.
-
-    Represents redacted/hidden reasoning content when the model's
-    thinking is not fully disclosed.
-    """
-
-    type: Literal["redacted_thinking"] = "redacted_thinking"
-    data: str
-
-
 class ToolUseContentBlock(BaseModel):
     """
     Tool use content block in Anthropic format.
@@ -87,34 +75,6 @@ class ToolUseContentBlock(BaseModel):
     id: str
     name: str
     input: Dict[str, Any]
-
-
-class ServerToolUseContentBlock(BaseModel):
-    """
-    Server-side tool use content block in Anthropic format.
-
-    Represents a tool call executed server-side by the API.
-    """
-
-    type: Literal["server_tool_use"] = "server_tool_use"
-    id: str
-    name: str
-    input: Dict[str, Any]
-
-
-class McpToolUseContentBlock(BaseModel):
-    """
-    MCP (Model Context Protocol) tool use content block in Anthropic format.
-
-    Represents a tool call routed through an MCP server.
-    """
-
-    type: Literal["mcp_tool_use"] = "mcp_tool_use"
-    id: str
-    name: str
-    input: Dict[str, Any]
-
-    model_config = {"extra": "allow"}
 
 
 class ToolReferenceContentBlock(BaseModel):
@@ -137,23 +97,12 @@ class ToolResultContentBlock(BaseModel):
 
     Represents the result of a tool call, sent by the user.
     Tool results can contain text, images, tool references, or a mix.
-    Falls back to Dict[str, Any] for unknown content block types.
     """
 
     type: Literal["tool_result"] = "tool_result"
     tool_use_id: str
     content: Optional[
-        Union[
-            str,
-            List[
-                Union[
-                    "TextContentBlock",
-                    "ImageContentBlock",
-                    "ToolReferenceContentBlock",
-                    Dict[str, Any],
-                ]
-            ],
-        ]
+        Union[str, List[Union["TextContentBlock", "ImageContentBlock", "ToolReferenceContentBlock"]]]
     ] = None
     is_error: Optional[bool] = None
 
@@ -212,54 +161,14 @@ class ImageContentBlock(BaseModel):
     source: Union[Base64ImageSource, URLImageSource]
 
 
-class Base64DocumentSource(BaseModel):
-    """Base64-encoded document source (e.g., PDF)."""
-
-    type: Literal["base64"] = "base64"
-    data: str
-
-
-class DocumentContentBlock(BaseModel):
-    """
-    Document content block in Anthropic format.
-
-    Represents an uploaded document (e.g., PDF) in a message.
-    """
-
-    type: Literal["document"] = "document"
-    source: Base64DocumentSource
-
-    model_config = {"extra": "allow"}
-
-
-class AdvisorToolResultContentBlock(BaseModel):
-    """
-    Advisor tool result content block in Anthropic format.
-
-    Represents results from advisor/agentic tool calls.
-    """
-
-    type: Literal["advisor_tool_result"] = "advisor_tool_result"
-    tool_use_id: str
-    content: Any
-
-    model_config = {"extra": "allow"}
-
-
-# Union type for all content blocks (including images, thinking, and tool references)
+# Union type for all content blocks (including images and thinking)
 ContentBlock = Union[
     TextContentBlock,
     ThinkingContentBlock,
-    RedactedThinkingContentBlock,
     ImageContentBlock,
-    DocumentContentBlock,
     ToolUseContentBlock,
-    ServerToolUseContentBlock,
-    McpToolUseContentBlock,
     ToolResultContentBlock,
     ToolReferenceContentBlock,
-    AdvisorToolResultContentBlock,
-    Dict[str, Any],
 ]
 
 
@@ -496,15 +405,7 @@ class AnthropicMessagesResponse(BaseModel):
     id: str
     type: Literal["message"] = "message"
     role: Literal["assistant"] = "assistant"
-    content: List[Union[
-        ThinkingContentBlock,
-        RedactedThinkingContentBlock,
-        TextContentBlock,
-        ToolUseContentBlock,
-        ServerToolUseContentBlock,
-        McpToolUseContentBlock,
-        Dict[str, Any],
-    ]]
+    content: List[Union[ThinkingContentBlock, TextContentBlock, ToolUseContentBlock]]
     model: str
     stop_reason: Optional[
         Literal["end_turn", "max_tokens", "stop_sequence", "tool_use"]
