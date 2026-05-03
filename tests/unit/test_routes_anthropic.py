@@ -1772,7 +1772,7 @@ class TestMessagesStreamingErrorHandling:
         return mock_instance, mock_response
 
     @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
-    @patch('kiro.routes_anthropic.stream_kiro_to_anthropic')
+    @patch('kiro.routes_anthropic.stream_with_first_token_retry_anthropic')
     @patch('kiro.routes_anthropic.KiroHttpClient')
     def test_streaming_exception_sends_error_event(
         self, mock_client_class, mock_stream_fn, mock_converter, test_client, valid_proxy_api_key
@@ -1807,7 +1807,7 @@ class TestMessagesStreamingErrorHandling:
         assert "event: error" in body
 
     @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
-    @patch('kiro.routes_anthropic.stream_kiro_to_anthropic')
+    @patch('kiro.routes_anthropic.stream_with_first_token_retry_anthropic')
     @patch('kiro.routes_anthropic.KiroHttpClient')
     def test_streaming_finally_closes_http_client(
         self, mock_client_class, mock_stream_fn, mock_converter, test_client, valid_proxy_api_key
@@ -1842,7 +1842,7 @@ class TestMessagesStreamingErrorHandling:
 
     @patch('kiro.routes_anthropic.debug_logger')
     @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
-    @patch('kiro.routes_anthropic.stream_kiro_to_anthropic')
+    @patch('kiro.routes_anthropic.stream_with_first_token_retry_anthropic')
     @patch('kiro.routes_anthropic.KiroHttpClient')
     def test_streaming_error_flushes_debug_logger(
         self, mock_client_class, mock_stream_fn, mock_converter, mock_debug_logger,
@@ -1878,7 +1878,7 @@ class TestMessagesStreamingErrorHandling:
 
     @patch('kiro.routes_anthropic.debug_logger')
     @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
-    @patch('kiro.routes_anthropic.stream_kiro_to_anthropic')
+    @patch('kiro.routes_anthropic.stream_with_first_token_retry_anthropic')
     @patch('kiro.routes_anthropic.KiroHttpClient')
     def test_streaming_success_discards_debug_buffers(
         self, mock_client_class, mock_stream_fn, mock_converter, mock_debug_logger,
@@ -2279,15 +2279,26 @@ class TestMessagesProfileArnAndHTTPException:
     ):
         """
         What it does: Verifies profile_arn is passed when auth_type is KIRO_DESKTOP.
-        Purpose: Exercise profile ARN code path (line 257).
+        Purpose: Exercise profile ARN code path. Post-upstream-merge the request
+        path goes through account_manager.get_first_account().auth_manager, so
+        we mock at that layer rather than directly on app.state.auth_manager.
         """
-        print("Setup: Set auth_manager to KIRO_DESKTOP with profile_arn...")
+        print("Setup: Mock account_manager so get_first_account returns KIRO_DESKTOP auth...")
         from kiro.auth import AuthType
         app = test_client.app
         mock_auth = MagicMock()
         mock_auth.auth_type = AuthType.KIRO_DESKTOP
         mock_auth.profile_arn = "arn:aws:iam::123456:role/test"
         mock_auth.api_host = "https://q.us-east-1.amazonaws.com"
+
+        mock_account = MagicMock()
+        mock_account.auth_manager = mock_auth
+
+        original_account_mgr = app.state.account_manager
+        mock_account_mgr = MagicMock()
+        mock_account_mgr.get_first_account = MagicMock(return_value=mock_account)
+        app.state.account_manager = mock_account_mgr
+        # Also override the legacy direct field for any code path that still reads it
         app.state.auth_manager = mock_auth
 
         mock_instance = AsyncMock()
@@ -2297,23 +2308,26 @@ class TestMessagesProfileArnAndHTTPException:
         mock_instance.close = AsyncMock()
         mock_client_class.return_value = mock_instance
 
-        print("Action: POST /v1/messages...")
-        test_client.post(
-            "/v1/messages",
-            headers={"x-api-key": valid_proxy_api_key},
-            json={
-                "model": "claude-sonnet-4-5",
-                "max_tokens": 1024,
-                "messages": [{"role": "user", "content": "Hello"}]
-            }
-        )
+        try:
+            print("Action: POST /v1/messages...")
+            test_client.post(
+                "/v1/messages",
+                headers={"x-api-key": valid_proxy_api_key},
+                json={
+                    "model": "claude-sonnet-4-5",
+                    "max_tokens": 1024,
+                    "messages": [{"role": "user", "content": "Hello"}]
+                }
+            )
 
-        print("Checking: anthropic_to_kiro called with profile_arn...")
-        assert mock_converter.called
-        call_args = mock_converter.call_args[0]
-        profile_arn = call_args[2]
-        print(f"profile_arn: {profile_arn}")
-        assert profile_arn == "arn:aws:iam::123456:role/test"
+            print("Checking: anthropic_to_kiro called with profile_arn...")
+            assert mock_converter.called
+            call_args = mock_converter.call_args[0]
+            profile_arn = call_args[2]
+            print(f"profile_arn: {profile_arn}")
+            assert profile_arn == "arn:aws:iam::123456:role/test"
+        finally:
+            app.state.account_manager = original_account_mgr
 
     @patch('kiro.routes_anthropic.anthropic_to_kiro', return_value={"messages": [], "conversationId": "test"})
     @patch('kiro.routes_anthropic.KiroHttpClient')
