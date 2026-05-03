@@ -340,13 +340,31 @@ def convert_anthropic_tools(
     tools: Optional[List[AnthropicTool]],
 ) -> Optional[List[UnifiedTool]]:
     """
-    Converts Anthropic tools to unified format.
+    Converts Anthropic tools to unified format, skipping server-managed tools.
+
+    Server-managed tools (e.g., ``web_search_20250305``) carry a ``type`` field
+    but no ``input_schema`` because the upstream Anthropic API executes them
+    server-side rather than dispatching to the client. Such tools cannot be
+    represented in the unified ``UnifiedTool`` shape (which requires
+    ``input_schema``) and are filtered out here.
+
+    This filter is defense-in-depth, not the primary handler. The native
+    web_search path is intercepted earlier in ``routes_anthropic.py``
+    (Path A, ``handle_native_web_search``) for any tool whose ``type`` starts
+    with ``web_search``. The skip below catches residual server-side tool
+    types that Path A does not match, preventing a crash when the converter
+    would otherwise try to construct ``UnifiedTool(input_schema=None)``.
+
+    The OpenAI converter applies the symmetric guard at
+    ``convert_openai_tools_to_unified`` (skipping non-function tools).
 
     Args:
-        tools: List of Anthropic tools
+        tools: List of Anthropic tools (Pydantic ``AnthropicTool`` or dict).
 
     Returns:
-        List of tools in unified format, or None if no tools
+        List of tools in unified format, or ``None`` if no user-defined
+        tools remain after filtering (including the case where ``tools``
+        is ``None`` or empty).
     """
     if not tools:
         return None
