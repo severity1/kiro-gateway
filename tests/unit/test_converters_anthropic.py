@@ -1478,6 +1478,119 @@ class TestConvertAnthropicTools:
         assert result is not None
         assert result[0].description is None
 
+    def test_skips_server_managed_tool_pydantic_no_schema(self):
+        """
+        What it does: Verifies that a server-managed AnthropicTool (has type,
+            no input_schema) is skipped, returning None when it is the only tool.
+        Purpose: Ensure the converter does not attempt to construct a UnifiedTool
+            with input_schema=None, which would crash. Also confirms the
+            logger.debug skip message is emitted.
+        """
+        print("Setup: Single server-managed tool (web_search_20250305)...")
+        tools = [AnthropicTool(type="web_search_20250305", name="web_search")]
+
+        print("Action: Converting tools with logger patched...")
+        with patch("kiro.converters_anthropic.logger") as mock_logger:
+            result = convert_anthropic_tools(tools)
+
+        print(f"Result: {result}")
+        print(f"Logger debug calls: {mock_logger.debug.call_args_list}")
+        assert result is None
+        # Verify the skip path emitted a debug log mentioning the tool name
+        assert mock_logger.debug.called
+        skip_call = mock_logger.debug.call_args
+        assert "web_search" in skip_call.args[0]
+        assert "web_search_20250305" in skip_call.args[0]
+
+    def test_skips_server_managed_tool_dict_no_schema_key(self):
+        """
+        What it does: Verifies that a dict-shaped server-managed tool with no
+            input_schema key at all is skipped.
+        Purpose: Ensure the dict branch handles missing keys (not just None
+            values) the same way as the Pydantic branch.
+        """
+        print("Setup: Dict tool with no input_schema key...")
+        tools = [{"type": "web_search_20250305", "name": "web_search"}]
+
+        print("Action: Converting tools...")
+        result = convert_anthropic_tools(tools)
+
+        print(f"Comparing result: Expected None, Got {result}")
+        assert result is None
+
+    def test_keeps_user_tool_skips_server_in_mixed_list(self):
+        """
+        What it does: Verifies a list containing both a user-defined tool and
+            a server-managed tool returns only the user tool.
+        Purpose: Ensure the skip is per-item, not all-or-nothing, so legitimate
+            user tools survive alongside server-side tools in the same request.
+        """
+        print("Setup: Mixed list (user tool + server-managed tool)...")
+        tools = [
+            AnthropicTool(
+                name="get_weather",
+                description="Get weather for a location",
+                input_schema={
+                    "type": "object",
+                    "properties": {"location": {"type": "string"}},
+                },
+            ),
+            AnthropicTool(type="web_search_20250305", name="web_search"),
+        ]
+
+        print("Action: Converting tools...")
+        result = convert_anthropic_tools(tools)
+
+        print(f"Result: {result}")
+        assert result is not None
+        assert len(result) == 1
+        assert result[0].name == "get_weather"
+
+    def test_skips_when_input_schema_explicitly_none(self):
+        """
+        What it does: Verifies that constructing AnthropicTool(name=..., input_schema=None)
+            without a `type` field raises ValidationError at Pydantic construction time,
+            never reaching the converter.
+        Purpose: Document the interaction between the upstream
+            validate_tool_consistency model_validator and the converter's skip.
+            User-defined tools (no type) must have input_schema; the validator
+            catches this before convert_anthropic_tools sees the input.
+        """
+        print("Setup: Attempting AnthropicTool with no type and no input_schema...")
+
+        print("Action: Construction should raise ValidationError...")
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError) as exc_info:
+            AnthropicTool(name="x", input_schema=None)
+
+        print(f"Caught ValidationError: {exc_info.value}")
+        assert "input_schema is required" in str(exc_info.value)
+
+    def test_returns_unified_tools_for_all_user_tools(self):
+        """
+        What it does: Verifies that a list of user-defined tools (none
+            server-managed) returns all of them as UnifiedTool instances with
+            no skips.
+        Purpose: Ensure the skip logic does not incorrectly drop legitimate
+            user tools when no server-managed tools are present.
+        """
+        print("Setup: Three user-defined tools...")
+        tools = [
+            AnthropicTool(name="tool_a", input_schema={"type": "object"}),
+            AnthropicTool(name="tool_b", input_schema={"type": "object"}),
+            AnthropicTool(name="tool_c", input_schema={"type": "object"}),
+        ]
+
+        print("Action: Converting tools...")
+        result = convert_anthropic_tools(tools)
+
+        print(f"Result: {result}")
+        assert result is not None
+        assert len(result) == 3
+        assert [t.name for t in result] == ["tool_a", "tool_b", "tool_c"]
+        assert all(isinstance(t, UnifiedTool) for t in result)
+
 
 # ==================================================================================================
 # Tests for anthropic_to_kiro
