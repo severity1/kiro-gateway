@@ -41,6 +41,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
 from kiro.tokenizer import count_message_tokens, count_tokens
+from kiro.config import PROFILE_ARN
+from kiro.utils import get_kiro_headers
 
 # Import debug_logger
 try:
@@ -135,7 +137,12 @@ async def call_kiro_mcp_api(
             "arguments": {"query": query}
         }
     }
-    
+
+    # profileArn is required by runtime.kiro.dev for all auth types (mirror completion paths)
+    profile_arn = auth_manager.profile_arn or PROFILE_ARN or ""
+    if profile_arn:
+        mcp_request["profileArn"] = profile_arn
+
     # Log MCP request
     try:
         mcp_request_json = json.dumps(mcp_request, ensure_ascii=False, indent=2).encode('utf-8')
@@ -146,13 +153,13 @@ async def call_kiro_mcp_api(
     
     try:
         token = await auth_manager.get_access_token()
-        
-        # EXACT headers from architecture
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "x-amzn-codewhisperer-optout": "false",
-            "Content-Type": "application/json"
-        }
+
+        # /mcp requires the same Kiro client-identity headers as the completion
+        # path (else 403); reuse get_kiro_headers and override what differs.
+        headers = get_kiro_headers(auth_manager, token)
+        headers["Content-Type"] = "application/json"  # /mcp is JSON-RPC
+        headers.pop("x-amz-target", None)
+        headers["x-amzn-codewhisperer-optout"] = "false"
         
         mcp_url = f"{auth_manager.q_host}/mcp"
         logger.debug(f"Calling MCP API: {mcp_url}")
@@ -161,7 +168,7 @@ async def call_kiro_mcp_api(
             response = await client.post(mcp_url, json=mcp_request, headers=headers)
             
             if response.status_code != 200:
-                logger.error(f"MCP API error: {response.status_code}")
+                logger.error(f"MCP API error: {response.status_code} - body: {response.text}")
                 return None, None
             
             mcp_response = response.json()
